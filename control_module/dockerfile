@@ -1,0 +1,14 @@
+# Dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN pip install fastapi uvicorn httpx
+
+COPY worker.py .
+
+# El puerto 80 es el puerto estándar DENTRO del contenedor
+EXPOSE 80
+
+# El CMD ejecutará uvicorn
+CMD ["uvicorn", "worker:app", "--host", "0.0.0.0", "--port", "80"]

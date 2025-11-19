@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  # 1. La Base de Datos (Redis)
+  redis:
+    image: redis:alpine
+    container_name: aecc_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - aecc_net
+
+  # 2. El Módulo de Control (Tu Balanceador)
+  control_module:
+    build: ./control_module
+    container_name: aecc_control
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis  # Le dice al Python que busque el host 'redis'
+    depends_on:
+      - redis
+    networks:
+      - aecc_net
+
+  # 3. Workers (Simulamos 3 nodos independientes)
+  worker_1:
+    build: ./worker_node
+    container_name: aecc_worker_1
+    environment:
+      - WORKER_ID=worker-1
+      - CONTROL_MODULE_URL=http://control_module:8000
+      - WORKER_ENDPOINT=http://worker_1:8001
+    ports:
+      - "8001:8001"
+    networks:
+      - aecc_net
+
+  worker_2:
+    build: ./worker_node
+    container_name: aecc_worker_2
+    environment:
+      - WORKER_ID=worker-2
+      - CONTROL_MODULE_URL=http://control_module:8000
+      - WORKER_ENDPOINT=http://worker_2:8001
+    ports:
+      - "8002:8001" # Mapeamos puerto 8002 externo al 8001 interno
+    networks:
+      - aecc_net
+
+  worker_3:
+    build: ./worker_node
+    container_name: aecc_worker_3
+    environment:
+      - WORKER_ID=worker-3
+      - CONTROL_MODULE_URL=http://control_module:8000
+      - WORKER_ENDPOINT=http://worker_3:8001
+    ports:
+      - "8003:8001"
+    networks:
+      - aecc_net
+
+networks:
+  aecc_net:
+    driver: bridge
