@@ -1,17 +1,17 @@
-# control_module.py (CORREGIDO PARA BALANCEO REAL)
+
 import uvicorn
 import httpx
 import redis.asyncio as redis
 import asyncio
 import time
 import json
-import random  # Necesario para romper el empate en el balanceo
+import random  
 import numpy as np
 from scipy import stats
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
-# --- Configuración ---
+#  Configuración
 UMBRAL_INACTIVIDAD = 40 # Segundos para marcar un worker como ERROR
 VENTANA_DRIFT = 50
 NIVEL_SIGNIFICANCIA = 0.05
@@ -21,7 +21,7 @@ buffer_datos_entrada = []
 
 app = FastAPI(title="AECC Control Architecture")
 redis_client = None
-http_client = None  # Cliente global para reusar conexiones
+http_client = None  
 
 class WorkerInfo(BaseModel):
     id_worker: str
@@ -53,7 +53,7 @@ async def shutdown_event():
     if http_client:
         await http_client.aclose()
 
-# --- Watchdog ---
+# Watchdog
 async def watchdog_process():
     while True:
         try:
@@ -69,7 +69,7 @@ async def watchdog_process():
             pass
         await asyncio.sleep(5)
 
-# --- Drift Detection ---
+# Drift Detection 
 def check_data_drift(new_value: float):
     global buffer_datos_entrada
     buffer_datos_entrada.append(new_value)
@@ -79,7 +79,7 @@ def check_data_drift(new_value: float):
             print(f"*** ALERTA DE DRIFT (p={p_value:.4f}) ***")
         buffer_datos_entrada = []
 
-# --- Lógica de Balanceo MEJORADA ---
+ 
 async def find_best_worker(id_model: str):
     workers = []
     # Recolectar workers activos
@@ -90,14 +90,13 @@ async def find_best_worker(id_model: str):
     
     if not workers: return None
     
-    # TRUCO: Mezclar aleatoriamente antes de buscar el mínimo.
-    # Si todos tienen carga=0, esto elige uno al azar en lugar de siempre el primero.
+    
     random.shuffle(workers)
     
     # Algoritmo: Menor 'current_requests' (Least Connections) 
     return min(workers, key=lambda w: int(w.get("current_requests", 0)))
 
-# --- Endpoints ---
+#  Endpoints 
 
 @app.post("/register_worker")
 async def register_worker(worker: WorkerInfo):
@@ -130,11 +129,7 @@ async def predict_proxy(id_model: str, request: Request, background_tasks: Backg
 
     worker_key = f"worker:{worker['id_worker']}"
     
-    # LOG VISUAL (Para que veas que sí entran las peticiones)
-    # Solo imprimimos cada 100 peticiones para no saturar la terminal con 10k usuarios
-    # O descomenta la linea de abajo para ver todas
-    # print(f"-> Redirigiendo a {worker['id_worker']} (Carga previa: {worker['current_requests']})")
-
+    
     try:
         body = await request.json()
         val = float(body.get("value", 0.5))
@@ -149,7 +144,6 @@ async def predict_proxy(id_model: str, request: Request, background_tasks: Backg
     start_time = time.time()
     
     try:
-        # 3. Forward usando el cliente GLOBAL
         response = await http_client.post(f"{worker['endpoint']}/predict", json=await request.json())
         response.raise_for_status()
         data = response.json()
@@ -168,7 +162,6 @@ async def predict_proxy(id_model: str, request: Request, background_tasks: Backg
         duration_ms = (time.time() - start_time) * 1000
         await redis_client.hincrby(worker_key, "current_requests", -1)
         await redis_client.hincrby(worker_key, "total_requests", 1)
-        # Usamos hset para actualizar latencia (podrías hacer un promedio móvil si quisieras)
         await redis_client.hset(worker_key, "avg_latency_ms", f"{duration_ms:.2f}")
 
     return data
@@ -189,7 +182,6 @@ async def dashboard_data():
     # ENVOLTURA MAGICA
     return {"data": workers}
 
-# Endpoint específico para tu Figura 3
 @app.get("/stats_fig_3")
 async def get_stats_fig_3():
     workers = await dashboard_data()
