@@ -1,57 +1,40 @@
 # worker.py
 import uvicorn
 import httpx
-import random
-import time
 import os
-import asyncio # Usamos asyncio para la simulación
+import time
+import random
 from fastapi import FastAPI, Request
 
 app = FastAPI()
 
-# --- Configuración del Worker ---
-# Leemos las variables de entorno que Docker nos dará
-WORKER_ID = os.getenv("WORKER_ID", f"worker_local_{random.randint(1000, 9999)}")
-CONTROL_MODULE_URL = os.getenv("CONTROL_MODULE_URL", "http://localhost:8000")
-WORKER_ENDPOINT = os.getenv("WORKER_ENDPOINT", "http://localhost:8001")
-MODELO_ID = "modelo_fraude" # Recuerda cambiar esto por el nombre de tu modelo real
-VERSION = 1.2
+# Variables de entorno (Docker)
+WORKER_ID = os.getenv("WORKER_ID", f"w-{random.randint(100,999)}")
+CONTROL_URL = os.getenv("CONTROL_MODULE_URL", "http://localhost:8000")
+MY_ENDPOINT = os.getenv("WORKER_ENDPOINT", "http://localhost:8001")
 
 @app.on_event("startup")
-async def register_worker():
-    """
-    Al iniciar, este worker se registra a sí mismo en la Tabla de Control.
-    """
-    print(f"Iniciando {WORKER_ID} ({MODELO_ID} v{VERSION})... registrando en {CONTROL_MODULE_URL}")
+async def register():
+    # Esperar un poco a que Redis/Control suban
+    time.sleep(3) 
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(f"{CONTROL_MODULE_URL}/register_worker", json={
+            # Registro alineado con Table I 
+            resp = await client.post(f"{CONTROL_URL}/register_worker", json={
                 "id_worker": WORKER_ID,
-                "id_modelo": MODELO_ID,
-                "version": VERSION,
-                "endpoint": WORKER_ENDPOINT
+                "id_model": "modelo_fraude",
+                "version": 1.2,
+                "endpoint": MY_ENDPOINT
             })
-            print(f"Worker {WORKER_ID} registrado exitosamente.")
-        except httpx.ConnectError:
-            print(f"ERROR: No se pudo conectar al Módulo de Control en {CONTROL_MODULE_URL}")
-            print("Asegúrate de que 'control_module.py' esté corriendo.")
+            print(f"Worker {WORKER_ID} registrado: {resp.status_code}")
+        except Exception as e:
+            print(f"Fallo al registrar {WORKER_ID}: {e}")
 
 @app.post("/predict")
 async def predict(request: Request):
-    """
-    Simula una predicción de ML.
-    """
-    # Simula el tiempo que tarda un modelo en procesar (entre 100ms y 500ms)
-    processing_time = random.uniform(0.1, 0.5) 
-    await asyncio.sleep(processing_time) # Usamos asyncio.sleep (no bloqueante)
-    
+    # Simular inferencia (Random Forest)
+    time.sleep(random.uniform(0.05, 0.2)) # Latencia simulada
     return {
-        "prediction": "ok", 
-        "processed_by": WORKER_ID,
-        "processing_time_ms": processing_time * 1000
+        "prediction": random.choice([0, 1]), # 0: Legit, 1: Fraude
+        "worker": WORKER_ID
     }
-
-@app.get("/health")
-def health_check():
-    """Endpoint simple para que el Módulo de Control verifique si está vivo."""
-    return {"status": "alive", "worker_id": WORKER_ID}

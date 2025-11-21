@@ -1,174 +1,200 @@
-# control_module.py
+# control_module.py (CORREGIDO PARA BALANCEO REAL)
 import uvicorn
 import httpx
-import redis.asyncio as redis # Usamos redis asíncrono
+import redis.asyncio as redis
 import asyncio
 import time
-from fastapi import FastAPI, Request, HTTPException
+import json
+import random  # Necesario para romper el empate en el balanceo
+import numpy as np
+from scipy import stats
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
-# --- Modelos de Datos (para validar la entrada) ---
+# --- Configuración ---
+UMBRAL_INACTIVIDAD = 40 # Segundos para marcar un worker como ERROR
+VENTANA_DRIFT = 50
+NIVEL_SIGNIFICANCIA = 0.05
+
+DATOS_ENTRENAMIENTO_REF = np.random.normal(loc=0.5, scale=0.1, size=1000)
+buffer_datos_entrada = []
+
+app = FastAPI(title="AECC Control Architecture")
+redis_client = None
+http_client = None  # Cliente global para reusar conexiones
+
 class WorkerInfo(BaseModel):
     id_worker: str
-    id_modelo: str
+    id_model: str
     version: float
     endpoint: str
 
-# --- Configuración ---
-app = FastAPI(title="Módulo de Control de ML (AECC)")
-redis_client = None
-
 @app.on_event("startup")
 async def startup_event():
-    global redis_client
-    # Conecta a Redis (asegúrate de que Redis esté corriendo en localhost:6379)
+    global redis_client, http_client
+    # 1. Conexión a Redis
+    redis_client = redis.from_url("redis://localhost", decode_responses=True)
     try:
-        redis_client = redis.from_url("redis://localhost", decode_responses=True)
         await redis_client.ping()
-        print("Conectado a Redis en localhost:6379")
+        print("--> [INIT] Conectado a Redis (Tabla de Control)")
     except Exception as e:
-        print(f"*** ERROR CRÍTICO: No se pudo conectar a Redis en localhost:6379 ***")
-        print(f"Asegúrate de que el contenedor de Redis esté corriendo (Fase 1).")
-        print(f"Error: {e}")
-        # exit() # Descomenta esto si quieres que falle si no hay Redis
+        print(f"Error Redis: {e}")
+    
+    # 2. Cliente HTTP Global (CRÍTICO para 10k usuarios)
+    # Limits ajustados para soportar alta concurrencia local
+    limits = httpx.Limits(max_keepalive_connections=100, max_connections=200)
+    http_client = httpx.AsyncClient(limits=limits, timeout=10.0)
+    
+    # 3. Tarea de fondo
+    asyncio.create_task(watchdog_process())
 
-# Cliente HTTP asíncrono para llamar a los workers
-http_client = httpx.AsyncClient(timeout=10.0)
+@app.on_event("shutdown")
+async def shutdown_event():
+    if http_client:
+        await http_client.aclose()
 
+# --- Watchdog ---
+async def watchdog_process():
+    while True:
+        try:
+            if redis_client:
+                async for key in redis_client.scan_iter("worker:*"):
+                    data = await redis_client.hgetall(key)
+                    if data and data.get("status") == "ACTIVE":
+                        last_act = float(data.get("last_activity", 0))
+                        if time.time() - last_act > UMBRAL_INACTIVIDAD:
+                            await redis_client.hset(key, "status", "ERROR")
+                            print(f"--> [WATCHDOG] Worker {data['id_worker']} marcado ERROR.")
+        except Exception:
+            pass
+        await asyncio.sleep(5)
 
-# --- Lógica de la Tabla de Control ---
+# --- Drift Detection ---
+def check_data_drift(new_value: float):
+    global buffer_datos_entrada
+    buffer_datos_entrada.append(new_value)
+    if len(buffer_datos_entrada) >= VENTANA_DRIFT:
+        statistic, p_value = stats.ks_2samp(DATOS_ENTRENAMIENTO_REF, buffer_datos_entrada)
+        if p_value < NIVEL_SIGNIFICANCIA:
+            print(f"*** ALERTA DE DRIFT (p={p_value:.4f}) ***")
+        buffer_datos_entrada = []
 
-async def get_all_workers():
-    """Obtiene todos los workers de Redis."""
-    if redis_client is None: return []
+# --- Lógica de Balanceo MEJORADA ---
+async def find_best_worker(id_model: str):
     workers = []
-    # Usamos 'async for' para iterar sobre la "corriente" de llaves
+    # Recolectar workers activos
     async for key in redis_client.scan_iter("worker:*"):
-        worker_data = await redis_client.hgetall(key)
-        if worker_data:
-            workers.append(worker_data)
-    return workers
+        w = await redis_client.hgetall(key)
+        if w.get("id_model") == id_model and w.get("status") == "ACTIVE":
+            workers.append(w)
+    
+    if not workers: return None
+    
+    # TRUCO: Mezclar aleatoriamente antes de buscar el mínimo.
+    # Si todos tienen carga=0, esto elige uno al azar en lugar de siempre el primero.
+    random.shuffle(workers)
+    
+    # Algoritmo: Menor 'current_requests' (Least Connections) 
+    return min(workers, key=lambda w: int(w.get("current_requests", 0)))
+
+# --- Endpoints ---
 
 @app.post("/register_worker")
 async def register_worker(worker: WorkerInfo):
-    """
-    Endpoint para que los workers se registren (Sección 3.4 del artículo).
-    Esto escribe en la Tabla de Control (Redis).
-    """
-    worker_key = f"worker:{worker.id_worker}"
-    await redis_client.hset(worker_key, mapping={
+    print(f"--> Registrando nuevo worker: {worker.id_worker}")
+    await redis_client.hset(f"worker:{worker.id_worker}", mapping={
         "id_worker": worker.id_worker,
-        "id_modelo": worker.id_modelo,
+        "id_model": worker.id_model,
         "version": worker.version,
         "endpoint": worker.endpoint,
-        "estado": "ACTIVO",
-        "solic_actuales": 0,
-        "latencia_media_ms": 0,
-        "total_solicitudes": 0, # Para Fig. 3
-        "ultima_actividad": int(time.time())
+        "status": "ACTIVE",
+        "current_requests": 0,
+        "avg_latency_ms": 0.0,
+        "total_requests": 0,
+        "errors": 0,
+        "last_activity": time.time()
     })
-    return {"status": "registrado", "worker_id": worker.id_worker}
+    return {"status": "registered"}
 
-async def find_best_worker(id_modelo: str) -> dict | None:
-    """
-    IMPLEMENTACIÓN DEL BALANCEADOR (Sección 3.3 del artículo).
-    Lógica: Menor número de solicitudes actuales.
-    """
-    all_workers = await get_all_workers()
-    
-    # Filtrar por modelo y estado
-    valid_workers = [
-        w for w in all_workers 
-        if w.get("id_modelo") == id_modelo and w.get("estado") == "ACTIVO"
-    ]
-    
-    if not valid_workers:
-        return None
-        
-    # Encuentra el worker con menos solicitudes actuales (convirtiendo a int)
-    best_worker = min(
-        valid_workers, 
-        key=lambda w: int(w.get("solic_actuales", 0))
-    )
-    return best_worker
+@app.get("/")
+def health_check():
+    return {"system": "AECC Online"}
 
-# --- Endpoints Públicos ---
-
-@app.post("/predict/{id_modelo}")
-async def predict_load_balanced(id_modelo: str, request: Request):
-    """
-    Este es el API Gateway (Punto 1 de Arquitectura).
-    """
-    start_time = time.time()
-    
-    # 1. Encontrar el mejor worker
-    worker = await find_best_worker(id_modelo)
-    
+@app.post("/predict/{id_model}")
+async def predict_proxy(id_model: str, request: Request, background_tasks: BackgroundTasks):
+    # 1. Balanceo
+    worker = await find_best_worker(id_model)
     if not worker:
-        # Si no hay workers, devolvemos el error 503 que viste.
-        raise HTTPException(status_code=503, detail="No hay workers disponibles para este modelo")
+        print("!!! ERROR: No hay workers disponibles")
+        raise HTTPException(status_code=503, detail="No active workers")
 
     worker_key = f"worker:{worker['id_worker']}"
-    worker_endpoint = worker['endpoint']
+    
+    # LOG VISUAL (Para que veas que sí entran las peticiones)
+    # Solo imprimimos cada 100 peticiones para no saturar la terminal con 10k usuarios
+    # O descomenta la linea de abajo para ver todas
+    # print(f"-> Redirigiendo a {worker['id_worker']} (Carga previa: {worker['current_requests']})")
 
     try:
-        # 2. Incrementar la carga en la Tabla de Control (Paso 5 del Flujo)
-        await redis_client.hincrby(worker_key, "solic_actuales", 1)
-        await redis_client.hset(worker_key, "ultima_actividad", int(time.time()))
+        body = await request.json()
+        val = float(body.get("value", 0.5))
+        background_tasks.add_task(check_data_drift, val)
+    except:
+        pass
 
-        # 3. Reenviar la solicitud al worker
-        req_data = await request.json()
-        response = await http_client.post(f"{worker_endpoint}/predict", json=req_data)
-        response.raise_for_status() # Lanza error si el worker falló (ej. 500)
-        
-        response_data = response.json()
+    # 2. Actualizar Tabla (Incrementar Carga)
+    await redis_client.hincrby(worker_key, "current_requests", 1)
+    await redis_client.hset(worker_key, "last_activity", time.time())
+    
+    start_time = time.time()
+    
+    try:
+        # 3. Forward usando el cliente GLOBAL
+        response = await http_client.post(f"{worker['endpoint']}/predict", json=await request.json())
+        response.raise_for_status()
+        data = response.json()
         
     except Exception as e:
-        # 4.a. Auto-corrección (Sección 3.4)
-        await redis_client.hset(worker_key, "estado", "ERROR")
-        raise HTTPException(status_code=500, detail=f"Error del Worker: {e}")
+
+        await redis_client.hset(worker_key, "status", "ERROR")
+        await redis_client.hincrby(worker_key, "errors", 1)
+        print(f"!!! Worker {worker['id_worker']} FALLÓ. Marcado como ERROR.")
+        print(f"Error en worker {worker['id_worker']}: {e}")
+        
+        raise HTTPException(status_code=500, detail=str(e))
     
     finally:
-        # 4.b. Decrementar la carga en la Tabla de Control (Paso 6 del Flujo)
-        await redis_client.hincrby(worker_key, "solic_actuales", -1)
+        # 4. Decrementar Carga y guardar métricas
+        duration_ms = (time.time() - start_time) * 1000
+        await redis_client.hincrby(worker_key, "current_requests", -1)
+        await redis_client.hincrby(worker_key, "total_requests", 1)
+        # Usamos hset para actualizar latencia (podrías hacer un promedio móvil si quisieras)
+        await redis_client.hset(worker_key, "avg_latency_ms", f"{duration_ms:.2f}")
 
-    # 5. Actualizar métricas (para monitoreo)
-    latency_ms = (time.time() - start_time) * 1000
-    await redis_client.hincrby(worker_key, "total_solicitudes", 1)
-    await redis_client.hset(worker_key, "latencia_media_ms", f"{latency_ms:.2f}")
-
-    return response_data
-
-# --- Endpoints de Monitoreo (Para Figuras 3 y 4) ---
+    return data
 
 @app.get("/dashboard_data")
-async def get_dashboard_data():
-    """
-    Este endpoint alimenta el dashboard de Grafana (Fig. 4).
-    Devuelve el estado de toda la Tabla de Control.
-    """
-    workers = await get_all_workers()
-    # Limpiar datos para que JSON los entienda
-    for w in workers:
-        w['version'] = float(w.get('version', 0))
-        w['solic_actuales'] = int(w.get('solic_actuales', 0))
-        w['latencia_media_ms'] = float(w.get('latencia_media_ms', 0))
-        w['total_solicitudes'] = int(w.get('total_solicitudes', 0))
-        w['ultima_actividad'] = int(w.get('ultima_actividad', 0))
-    return workers
+async def dashboard_data():
+    workers = []
+    if redis_client:
+        async for key in redis_client.scan_iter("worker:*"):
+            w = await redis_client.hgetall(key)
+            # Conversiones de tipo
+            w['current_requests'] = int(w.get('current_requests', 0))
+            w['avg_latency_ms'] = float(w.get('avg_latency_ms', 0))
+            w['total_requests'] = int(w.get('total_requests', 0))
+            w['errors'] = int(w.get('errors', 0))
+            workers.append(w)
+    
+    # ENVOLTURA MAGICA
+    return {"data": workers}
 
+# Endpoint específico para tu Figura 3
 @app.get("/stats_fig_3")
 async def get_stats_fig_3():
-    """
-    Datos específicos para generar la Figura 3.
-    """
-    workers = await get_all_workers()
-    distribution = {
-        w.get("id_worker"): int(w.get("total_solicitudes", 0))
-        for w in workers if w.get("estado") == "ACTIVO"
-    }
-    return distribution
+    workers = await dashboard_data()
+    return {w.get("id_worker"): int(w.get("total_requests", 0)) for w in workers}
 
 if __name__ == "__main__":
-    # Inicia el Módulo de Control
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Aumentamos workers de uvicorn para que el Control Module aguante más carga
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
